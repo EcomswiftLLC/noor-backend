@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify"
 import { qfGet, QfUnavailableError } from "../services/quranFoundationClient.js"
 import { TtlCache } from "../services/ttlCache.js"
 import { isQfConfigured } from "../config/env.js"
+import { toVerseTimestamps } from "../services/audioTimestamps.js"
 
 interface ChapterRecitersResponse {
   reciters: Array<{
@@ -21,6 +22,8 @@ interface ChapterAudioFileResponse {
     file_size: number
     format: string
     audio_url: string
+    // Present only when requested with segments=true.
+    timestamps?: unknown
   } | null
 }
 
@@ -44,7 +47,7 @@ export default async function reciterRoutes(app: FastifyInstance) {
     }
   })
 
-  app.get<{ Params: { reciterId: string; chapterNumber: string } }>(
+  app.get<{ Params: { reciterId: string; chapterNumber: string }; Querystring: { segments?: string } }>(
     "/api/v1/audio/:reciterId/:chapterNumber",
     async (req, reply) => {
       if (!isQfConfigured()) {
@@ -52,12 +55,26 @@ export default async function reciterRoutes(app: FastifyInstance) {
         return { available: false, reason: "not_configured" }
       }
       const { reciterId, chapterNumber } = req.params
+      // segments=true asks QF for per-ayah timestamps, which the app uses to
+      // highlight the ayah being recited. Older app builds never send it.
+      const withSegments = req.query.segments === "true"
       try {
-        const data = await qfGet<ChapterAudioFileResponse>(`/chapter_recitations/${reciterId}/${chapterNumber}`)
+        const data = await qfGet<ChapterAudioFileResponse>(
+          `/chapter_recitations/${reciterId}/${chapterNumber}`,
+          withSegments ? { segments: "true" } : undefined,
+        )
         // QF sometimes returns file_size as a float (e.g. 371.65); the Android
         // client parses it as a Long, so normalize to a whole number of bytes.
         const audio = data.audio_file
-          ? { ...data.audio_file, file_size: Math.round(Number(data.audio_file.file_size) || 0) }
+          ? (() => {
+              const { timestamps, ...file } = data.audio_file
+              const verseTimestamps = withSegments ? toVerseTimestamps(timestamps) : undefined
+              return {
+                ...file,
+                file_size: Math.round(Number(file.file_size) || 0),
+                ...(verseTimestamps ? { timestamps: verseTimestamps } : {}),
+              }
+            })()
           : null
         return { available: true, audio }
       } catch (err) {
